@@ -15,6 +15,18 @@
 ;   up/down     more/fewer trails (1..7)
 ;   left/right  slower/faster swirl (resets the unwinding)
 ;   fire        summon again (restart the growth)
+; Keys:
+;   + / -       unfold / fold the trails (the phone's tilt-driven "dmove")
+;   RUN/STOP    return to BASIC
+;
+;
+; Sound: the Android drone (AmbilectricSynth) on the SID -- two sawtooth hums
+; at 61 and 52 Hz swelling at their own rates, quiet noise static, and short
+; random chirps at 800-1600 Hz.
+;
+; Each summon starts as a crisp pentagram (dmove 0) that grows, then unfolds
+; into the trail loops (dmove 1). On the phone dmove follows the device's
+; motion; here it is clamped to -1..1 so the trails stay on screen.
 ;
 ; Build:  python3 gen_tables.py && acme pentagram.asm   ->  pentagram.prg
 ; Run:    LOAD"PENTAGRAM",8,1 / RUN   (or x64sc pentagram.prg)
@@ -28,6 +40,7 @@ CY      = 92            ; centre y
 RMAX    = 76            ; final star radius
 FLOOR   = $4d           ; modspeed minimum, 0.3 in 8.8 fixed point
 SPDSTEP = $33           ; 0.2 in 8.8
+UNFOLDR = 57            ; radius at which the automatic unfold starts
 
 SYTAB   = $8000         ; 7 pages: trail y offset by angle, per trail
 SXTAB   = $8800         ; 7 pages: trail x offset by angle, per trail
@@ -100,6 +113,12 @@ acc1    = $52
 acc2    = $53
 inc0    = $54
 inc1    = $55
+dm      = $56           ; dmove in eighths, -8..8
+autounf = $57           ; 1 while the automatic unfold is pending
+amplo   = $58           ; trail amplitude fraction (amp is the integer part)
+dsign   = $59           ; $80 if dm < 0
+mval    = $5a
+adm     = $5b           ; |dm|
 
 joyprev = $70           ; used by the IRQ only
 joypend = $71           ; joystick presses latched by the IRQ
@@ -108,6 +127,23 @@ ip1     = $74
 icnt    = $76
 seed    = $77
 itmp    = $78
+stoppend = $79          ; RUN/STOP latched by the IRQ
+keyprev = $7a
+keypend = $7b           ; + / - presses latched by the IRQ
+v1cnt   = $7c           ; drone sequencer, IRQ only
+v2cnt   = $7d
+v2ctl   = $7e
+aphase  = $7f
+chirpon = $80
+seedhi  = $81
+volcnt  = $82
+mvol    = $83
+v1flo   = $84           ; voice 1 drone frequency for this machine
+v1fhi   = $85
+chbase  = $86           ; chirp frequency high byte: base and range
+chrange = $87
+
+zpsave  = $c800         ; BASIC's zero page $02-$8f, restored on exit
 
 ; --- BASIC stub: 10 SYS2061 ------------------------------------------------
         * = $0801
@@ -119,6 +155,13 @@ itmp    = $78
 
 ; --- init ------------------------------------------------------------------
 start   sei
+        tsx                     ; remember how to get back to BASIC
+        stx savesp
+        ldx #$8e                ; save $02-$8f
+-       lda $01,x
+        sta zpsave-1,x
+        dex
+        bne -
         lda #0
         sta $d020
         sta $d021
@@ -128,11 +171,8 @@ start   sei
         sta $d016
         lda #$18                ; screen at +$0400, bitmap at +$2000
         sta $d018
-        lda #$ff                ; SID voice 3 noise as a random source
-        sta $d40e
-        sta $d40f
-        lda #$80
-        sta $d412
+        jsr detect
+        jsr sidinit
         lda #$ff                ; no keyboard rows selected: port A = joystick 2
         sta $dc00
 
@@ -164,8 +204,13 @@ start   sei
         lda #0
         sta joyprev
         sta joypend
+        sta stoppend
+        sta keyprev
+        sta keypend
         lda #1
         sta seed
+        lda #0
+        sta seedhi
         lda #<irq
         sta $0314
         lda #>irq
@@ -178,10 +223,7 @@ start   sei
         sta speed
         lda #$01
         sta speed+1
-restart lda #1
-        sta r
-        lda #$ff
-        sta tabr
+restart jsr summon
         lda speed
         sta mspd
         lda speed+1
@@ -252,23 +294,113 @@ frame   lda r
         lda t1
         sta mspd+1
 ++
+        ; unfold: dmove 0 -> 1 once the star has mostly grown
+        lda autounf
+        beq +
+        lda r
+        cmp #UNFOLDR
+        bcc +
+        inc dm
+        lda #$ff
+        sta tabr
+        inc changed
+        lda dm
+        cmp #8
+        bne +
+        lda #0
+        sta autounf
++
         jsr handlejoy
-        lda changed
-        bne frame
-idle    jsr handlejoy           ; star has settled: only the IRQ flicker runs
+        jsr checkstop
         lda changed
         beq idle
         jmp frame
+idle    jsr handlejoy           ; star has settled: only the IRQ flicker runs
+        jsr checkstop
+        lda changed
+        beq idle
+        jmp frame
+
+; --- RUN/STOP: put everything back and return to BASIC ---------------------
+        !zone checkstop
+checkstop
+        lda stoppend
+        bne +
+        rts
++       sei
+        lda #<$ea31             ; KERNAL IRQ handler
+        sta $0314
+        lda #>$ea31
+        sta $0315
+        lda #0                  ; silence the SID
+        sta $d418
+        sta $d404
+        sta $d40b
+        sta $d412
+        lda $dd00               ; VIC bank 0
+        ora #3
+        sta $dd00
+        lda #$1b                ; text mode, default screen and charset
+        sta $d011
+        lda #$c8
+        sta $d016
+        lda #$15
+        sta $d018
+        lda #14
+        sta $d020
+        lda #6
+        sta $d021
+        lda #$7f                ; wait for RUN/STOP to be released,
+        sta $dc00               ; or BASIC would see it and print BREAK
+-       lda $dc01
+        bpl -
+        ldx #$8e
+-       lda zpsave-1,x
+        sta $01,x
+        dex
+        bne -
+        ldx savesp
+        txs
+        cli
+        jsr $e544               ; clear screen
+        rts                     ; back to the SYS in BASIC
+
+savesp  !byte 0
 
 ; --- joystick --------------------------------------------------------------
         !zone handlejoy
 handlejoy
         sei
         ldx #0
+        lda keypend
+        stx keypend
+        sta tmp2
         lda joypend
         stx joypend
         cli
         sta tmp
+        lda tmp2
+        beq .joy
+        inc changed             ; a key takes over from the automatic unfold
+        lda #0
+        sta autounf
+        lda #$ff
+        sta tabr
+        lsr tmp2                ; +: unfold
+        bcc +
+        lda dm
+        cmp #8
+        beq +
+        inc dm
++       lsr tmp2
+        lsr tmp2
+        lsr tmp2                ; -: fold
+        bcc .joy
+        lda dm
+        cmp #$f8
+        beq .joy
+        dec dm
+.joy    lda tmp
         beq .done
         inc changed
         lsr tmp                 ; up: more trails
@@ -318,10 +450,16 @@ handlejoy
 +       jsr setmspd
 ++      lsr tmp                 ; fire: summon again
         bcc .done
-        lda #1
-        sta r
-        jsr setmspd
+        jsr summon
 .done   rts
+
+summon  lda #1                  ; start small, folded, swirling at full speed
+        sta r
+        sta autounf
+        lda #0
+        sta dm
+        lda #$ff
+        sta tabr
 
 setmspd lda speed
         sta mspd
@@ -329,21 +467,59 @@ setmspd lda speed
         sta mspd+1
         rts
 
-; --- trail offset tables (only when r changes) -----------------------------
+; --- trail offset tables (only when r or dmove changes) -------------------
 ; SY_p[t] = trunc(A_p * sin t) + 1,  SX_p[t] = trunc(A_p * cos t) + 1,
-; A_p = r / (3p), for the trails in use
+; A_p = dmove * r / (3p), for the trails in use
         !zone buildamp
 buildamp
+        lda dm
+        and #$80
+        sta dsign
+        lda dm
+        bpl +
+        eor #$ff
+        clc
+        adc #1
++       sta adm
         lda #0
         sta ptr
         sta ptr2
         sta pidx
-.p      ldx pidx
+.p      ldx pidx                ; amp.amplo = r * 256/(3p) * |dm| / 8
         lda recip3p,x
         tax
         lda r
         jsr mul
+        lda prodlo
+        sta t0
         lda prodhi
+        sta t1
+        lda t0
+        ldx adm
+        jsr mul
+        lda prodlo
+        sta acc0
+        lda prodhi
+        sta acc1
+        lda t1
+        ldx adm
+        jsr mul
+        clc
+        lda acc1
+        adc prodlo
+        sta acc1
+        lda prodhi
+        adc #0
+        sta acc2
+        ldx #3
+-       lsr acc2
+        ror acc1
+        ror acc0
+        dex
+        bne -
+        lda acc0
+        sta amplo
+        lda acc1
         sta amp
         lda pidx
         clc
@@ -354,22 +530,41 @@ buildamp
         adc #>SXTAB
         sta ptr2+1
         ldy #0
-.t      sty tmp
+.t      sty tmp                 ; P = amp.amplo * m,  A*|sin| ~= (P + P/256) / 256
         lda sinmag,y
+        sta mval
         ldx amp
         jsr mul
-        ldy tmp
-        lda prodlo              ; (A*m + A) / 256 ~= A * |sin|
-        clc
-        adc amp
+        lda prodlo
+        sta t0
         lda prodhi
-        adc #0
-        cpy #128
-        bcc +
-        eor #$ff
+        sta t1
+        lda mval
+        ldx amplo
+        jsr mul
         clc
-        adc #1
-+       clc
+        lda t0
+        adc prodhi
+        sta t0
+        bcc +
+        inc t1
++       lda t0
+        clc
+        adc t1
+        lda t1
+        adc #0
+        sta tmp2
+        ldy tmp
+        tya                     ; negative when sin < 0, flipped for dmove < 0
+        and #$80
+        eor dsign
+        beq +
+        lda #0
+        sec
+        sbc tmp2
+        sta tmp2
++       lda tmp2
+        clc
         adc #1
         sta (ptr),y
         sta tmp2
@@ -385,8 +580,9 @@ buildamp
         inc pidx
         lda pidx
         cmp trails
-        bne .p
-        rts
+        beq +
+        jmp .p
++       rts
 
 ; --- trail angle tables (every frame) --------------------------------------
 ; trail p angle = (pi*p - rad2) * modspeed*15*p. In binary degrees with
@@ -968,7 +1164,7 @@ genrows lda #<($2000 + 32)      ; row y: $2000 + 32 + (y/8)*320 + (y&7)
         bne -
         rts
 
-; --- IRQ: latch joystick presses, flicker cell colours ---------------------
+; --- IRQ: latch joystick and keys, flicker cell colours, drone ------------
         !zone irq
 irq     lda $dc0d
         lda $dc00
@@ -982,6 +1178,27 @@ irq     lda $dc0d
         sta joypend
         lda itmp
         sta joyprev
+        lda #$df                ; keyboard column 5: + is row bit 0, - is bit 3
+        sta $dc00
+        lda $dc01
+        eor #$ff
+        and #$09
+        sta itmp
+        lda keyprev
+        eor #$ff
+        and itmp
+        ora keypend
+        sta keypend
+        lda itmp
+        sta keyprev
+        lda #$7f                ; keyboard column 7: RUN/STOP is row bit 7
+        sta $dc00
+        lda $dc01
+        bmi +
+        lda #1
+        sta stoppend
++       lda #$ff
+        sta $dc00
         lda #24
         sta icnt
 -       jsr irnd                ; recolour 24 random cells in both screens
@@ -1002,14 +1219,175 @@ irq     lda $dc0d
         sta (ip1),y
         dec icnt
         bne -
+        jsr drone
         jmp $ea81
 
-irnd    lda seed
-        asl
+; --- drone ------------------------------------------------------------------
+; The SID has no per-voice volume, so the swells come from the envelopes:
+; voice 1 is re-triggered every 5.9 s (rises to full, decays back to half);
+; voice 2 is gated on/off every 3.45 s, and its 8 s attack is cut off at
+; about 43% so, as on Android, it never gets louder than voice 1's quietest.
+; Voice 3 is steady quiet noise (also the random source). A chirp moves
+; voice 1 to a random 800-1600 Hz for one IRQ tick (~17 ms). The master
+; volume fades in over 10 s, like GraphicDmn's synth.setVol ramp.
+; SID pitch follows the CPU clock (PAL 985248 Hz, NTSC 1022727 Hz), so the
+; frequency values are picked for the machine detected at start-up.
+V1HALF  = 177           ; voice 1 retrigger period, in 2-tick steps (5.9 s)
+V2HALF  = 104           ; voice 2 gate on/off time, in 2-tick steps (3.45 s)
+
+; Fn = Hz * 16777216 / clock          PAL    NTSC
+f61lo   !byte <1039, <1001      ; 61 Hz
+f61hi   !byte >1039, >1001
+f52lo   !byte <885, <853        ; 52 Hz
+f52hi   !byte >885, >853
+fchb    !byte $35, $33          ; 800 Hz high byte
+fchr    !byte 53, 52            ; high bytes up to 1600 Hz
+
+machine !byte 0                 ; 0 = PAL, 1 = NTSC
+
+; Count raster lines: the last line is $137 on PAL (312 lines) and $106 or
+; $105 on NTSC (263/262), so the low byte before the wrap tells them apart.
+; Runs with interrupts off.
+detect
+-       lda $d012
+--      cmp $d012
+        beq --
+        bmi -
+        ldx #0
+        cmp #$20
+        bcs +
+        inx
++       stx machine
+        rts
+
+sidinit ldx #$18
+        lda #0
+-       sta $d400,x
+        dex
+        bpl -
+        ldx machine
+        lda f61lo,x
+        sta v1flo
+        lda f61hi,x
+        sta v1fhi
+        lda fchb,x
+        sta chbase
+        lda fchr,x
+        sta chrange
+        lda v1flo               ; voice 1: 61 Hz sawtooth
+        sta $d400
+        lda v1fhi
+        sta $d401
+        lda #$ee                ; attack and decay ~2.4 s over the 50-100% swell
+        sta $d405
+        lda #$8c                ; sustain 8/15, release 3 s
+        sta $d406
+        lda f52lo,x             ; voice 2: 52 Hz sawtooth
+        sta $d407
+        lda f52hi,x
+        sta $d408
+        lda #$fc                ; attack 8 s (gated off at ~43%)
+        sta $d40c
+        lda #$fc                ; release 3 s
+        sta $d40d
+        lda #$ff                ; voice 3: noise static
+        sta $d40e
+        sta $d40f
+        lda #$00                ; straight to sustain 4/15: no swell
+        sta $d413
+        lda #$4c
+        sta $d414
+        lda #0                  ; master volume fades in from 0, no filter
+        sta mvol
+        sta $d418
+        lda #40
+        sta volcnt
+        lda #V1HALF
+        sta v1cnt
+        lda #V2HALF
+        sta v2cnt
+        lda #0
+        sta aphase
+        sta chirpon
+        lda #$21                ; gate on: the attacks fade the drone in
+        sta $d404
+        sta $d40b
+        sta v2ctl
+        lda #$81
+        sta $d412
+        rts
+
+drone   lda mvol                ; fade in: one volume step every 40 ticks
+        cmp #15
+        beq +
+        dec volcnt
+        bne +
+        lda #40
+        sta volcnt
+        inc mvol
+        lda mvol
+        sta $d418
++       lda chirpon             ; end a chirp after one tick
+        beq +
+        lda v1flo
+        sta $d400
+        lda v1fhi
+        sta $d401
+        lda #0
+        sta chirpon
+        jmp ++
++       jsr irnd                ; ~1 chirp per second, as on Android
+        cmp #4
+        bcs ++
+        jsr irnd
+        and #$3f
+        cmp chrange
         bcc +
-        eor #$1d
-+       sta seed
-        eor $d41b
+        sbc chrange
++       clc
+        adc chbase              ; 800-1600 Hz for this machine's clock
+        sta $d401
+        jsr irnd
+        sta $d400
+        inc chirpon
+++      lda aphase              ; the swells step every other tick
+        eor #1
+        sta aphase
+        beq .done
+        dec v1cnt
+        lda v1cnt
+        cmp #1
+        bne +
+        lda #$20                ; gate voice 1 off for one step...
+        sta $d404
++       lda v1cnt
+        bne +
+        lda #$21                ; ...then on again: attack from where it was
+        sta $d404
+        lda #V1HALF
+        sta v1cnt
++       dec v2cnt
+        bne .done
+        lda v2ctl               ; toggle voice 2 between attack and release
+        eor #1
+        sta v2ctl
+        sta $d40b
+        lda #V2HALF
+        sta v2cnt
+.done   rts
+
+irnd    lda seedhi          ; 16-bit xorshift (7,9,8), after John Metcalf
+        lsr
+        lda seed
+        ror
+        eor seedhi
+        sta seedhi
+        ror
+        eor seed
+        sta seed
+        eor seedhi
+        sta seedhi
+        eor $d41b               ; plus SID noise; the state stays pure xorshift
         rts
 
 coltab  !byte $30,$30,$30,$50,$30,$30,$b0,$30   ; mostly cyan, some green/grey
